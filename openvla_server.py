@@ -11,10 +11,20 @@ import argparse
 import sglang as sgl
 
 
+ACTION_DIM = 7
+MAX_ACTION_GENERATION_ATTEMPTS = 3
+
+
 @sgl.function
 def image_qa(s, image_path, question):
     s += sgl.image(image_path) + question
-    s += sgl.gen("action")
+    s += sgl.gen(
+        "action",
+        max_tokens=ACTION_DIM,
+        min_tokens=ACTION_DIM,
+        ignore_eos=True,
+        return_logprob=True,
+    )
 
 
 class TokenToAction:
@@ -36,6 +46,11 @@ class TokenToAction:
 
     def convert(self, output_ids):
         predicted_action_token_ids = np.array(output_ids)
+        if predicted_action_token_ids.shape[-1] != ACTION_DIM:
+            raise ValueError(
+                f"Expected {ACTION_DIM} action tokens, got {predicted_action_token_ids.shape[-1]}: "
+                f"{predicted_action_token_ids.tolist()}"
+            )
         discretized_actions = self.vocab_size - predicted_action_token_ids
         discretized_actions = np.clip(
             discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1
@@ -122,43 +137,64 @@ async def batch_actions(request: BatchRequest):
         if not os.path.exists(request.image_path):
             raise HTTPException(status_code=400, detail=f"Image file not found: {request.image_path}")
         
-        # Prepare batch arguments
-        arguments = []
-        for instruction in request.instructions:
-            question = f"In: What action should the robot take to {instruction}?\nOut:"
-            arguments.append({
-                "image_path": request.image_path,
-                "question": question,
-            })
-        
-        # Run batch inference
-        states = image_qa.run_batch(
-            arguments,
-            max_new_tokens=7,
-            temperature=request.temperature,
-            return_logprob=True
-        )
-        
-        # Process results
-        all_output_ids = []
-        all_actions = []
-        
-        for state in states:
-            # Extract output token IDs
-            output_logprobs = state.get_meta_info("action")["output_token_logprobs"]
-            output_ids = [logprob[1] for logprob in output_logprobs]
-            
-            # Convert tokens to actions
-            actions = converter.convert(output_ids)
-            
-            all_output_ids.append(output_ids)
-            all_actions.append(actions.tolist())
+        all_output_ids = [None] * len(request.instructions)
+        all_actions = [None] * len(request.instructions)
+        pending = list(enumerate(request.instructions))
+
+        for attempt in range(1, MAX_ACTION_GENERATION_ATTEMPTS + 1):
+            if not pending:
+                break
+
+            arguments = []
+            for _, instruction in pending:
+                question = f"In: What action should the robot take to {instruction}?\nOut:"
+                arguments.append({
+                    "image_path": request.image_path,
+                    "question": question,
+                })
+
+            states = image_qa.run_batch(
+                arguments,
+                temperature=request.temperature,
+            )
+
+            retry_pending = []
+            for (request_idx, instruction), state in zip(pending, states):
+                output_logprobs = state.get_meta_info("action")["output_token_logprobs"]
+                output_ids = [logprob[1] for logprob in output_logprobs]
+
+                try:
+                    actions = converter.convert(output_ids)
+                except ValueError as e:
+                    print(
+                        f"Invalid action generation on attempt {attempt}/"
+                        f"{MAX_ACTION_GENERATION_ATTEMPTS}: {e}"
+                    )
+                    retry_pending.append((request_idx, instruction))
+                    continue
+
+                all_output_ids[request_idx] = output_ids
+                all_actions[request_idx] = actions.tolist()
+
+            pending = retry_pending
+
+        if pending:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Failed to generate {ACTION_DIM} action tokens for "
+                    f"{len(pending)} / {len(request.instructions)} requests after "
+                    f"{MAX_ACTION_GENERATION_ATTEMPTS} attempts"
+                ),
+            )
         
         return BatchResponse(
             output_ids=all_output_ids,
             actions=all_actions
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing batch: {str(e)}")
 
