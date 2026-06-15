@@ -100,14 +100,22 @@ async def startup_event():
     global runtime
     # Get seed from environment variable (set in __main__)
     seed = int(os.environ.get("VLA_RANDOM_SEED", "42"))
-    runtime = sgl.Runtime(
+    rt_kwargs = dict(
         model_path="openvla/openvla-7b",
         tokenizer_path="openvla/openvla-7b",
         disable_cuda_graph=True,
         disable_radix_cache=True,
         random_seed=seed,
-        trust_remote_code=True
+        trust_remote_code=True,
     )
+    # Optionally cap the static memory fraction so the server can share a GPU
+    # with another process (e.g. the in-process verifier + SAPIEN eval on a
+    # single H200). Unset -> sglang default.
+    _mf = os.environ.get("VLA_MEM_FRACTION", "").strip()
+    if _mf:
+        rt_kwargs["mem_fraction_static"] = float(_mf)
+        print(f"[openvla_server] mem_fraction_static={_mf}")
+    runtime = sgl.Runtime(**rt_kwargs)
     sgl.set_default_backend(runtime)
     print(f"SGLang runtime initialized successfully with seed: {seed}")
 
